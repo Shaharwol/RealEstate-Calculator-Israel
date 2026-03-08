@@ -4,14 +4,71 @@ import sys
 import os
 import re
 import math
-import requests
-from bs4 import BeautifulSoup
+import json
+import webbrowser
+import csv
+from tkinter import filedialog, messagebox
+#import requests
+#from bs4 import BeautifulSoup
 from typing import List, Tuple, Optional
 import matplotlib.pyplot as plt
 from matplotlib import rcParams
 rcParams['font.family'] = 'DejaVu Sans'
-
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+
+def open_gov_site():
+    """Opens the official tax simulator."""
+    webbrowser.open("https://www.gov.il/he/service/real_eatate_taxsimulator")
+
+
+def show_current_tax_brackets_window():
+    """
+    NOTE: Opens a popup window displaying the currently loaded tax brackets.
+    This provides transparency to the user.
+    """
+    brackets_data = load_tax_brackets_from_json()
+
+    # Create popup window
+    win = tk.Toplevel(root)
+    win.title("מדרגות מס רכישה בשימוש")
+    win.geometry("700x500")
+
+    # Title
+    tk.Label(win, text="מדרגות המס הטעונות במערכת (2026)", font=("Arial", 14, "bold"), fg="blue").pack(pady=10)
+
+    # Link button
+    tk.Button(win, text="בדיקת עדכניות באתר Gov.il 🌐", command=open_gov_site, bg="#e1f5fe").pack(pady=5)
+
+    # Frame for tables (Side by Side)
+    container = tk.Frame(win)
+    container.pack(fill="both", expand=True, padx=10, pady=10)
+
+    # --- Helper to render a table ---
+    def render_table(parent, title, bracket_list):
+        frame = tk.LabelFrame(parent, text=title, font=("Arial", 12, "bold"))
+        frame.pack(side="left", fill="both", expand=True, padx=5)
+
+        # Headers
+        tk.Label(frame, text="מ- (₪)", font=("Arial", 10, "bold")).grid(row=0, column=0, padx=5)
+        tk.Label(frame, text="עד- (₪)", font=("Arial", 10, "bold")).grid(row=0, column=1, padx=5)
+        tk.Label(frame, text="מס (%)", font=("Arial", 10, "bold")).grid(row=0, column=2, padx=5)
+
+        for i, (low, high, rate) in enumerate(bracket_list):
+            high_str = "∞" if high == float("inf") else f"{high:,.0f}"
+            tk.Label(frame, text=f"{low:,.0f}").grid(row=i + 1, column=0)
+            tk.Label(frame, text=high_str).grid(row=i + 1, column=1)
+            tk.Label(frame, text=f"{rate * 100:.1f}%").grid(row=i + 1, column=2)
+
+    # Render Single Home Brackets
+    render_table(container, "דירה יחידה", brackets_data.get("single_home", []))
+
+    # Render Additional Home Brackets
+    render_table(container, "דירה נוספת (להשקעה)", brackets_data.get("additional_home", []))
+
+    # Close button
+    tk.Button(win, text="סגור", command=win.destroy).pack(pady=10)
+
 
 # ==============================
 # Globals
@@ -43,7 +100,8 @@ entry_buy_price = None
 entry_broker_buy = None
 entry_lawyer_buy = None
 
-is_single_home_var = None
+is_single_home_var = None           # For Sale (Capital Gains Exemption)
+is_single_home_purchase_var = None  # For Purchase (Tax Brackets Logic)
 held_over_18_var = None
 
 # ==============================
@@ -95,86 +153,74 @@ def format_entry_number(entry_widget: tk.Entry) -> None:
         entry_widget.delete(0, tk.END)
         entry_widget.insert(0, formatted)
 
+
 # ==============================
-# Tax brackets handling
+# Tax brackets handling (JSON Config)
 # ==============================
 
-FALLBACK_PURCHASE_BRACKETS: List[Tuple[int, float, float]] = [
-    (0, 1978745, 0.0),
-    (1978745, 2347040, 0.035),
-    (2347040, 6055070, 0.05),
-    (6055070, 20183565, 0.08),
-    (20183565, float("inf"), 0.10),
-]
+TAX_FILE_NAME = "tax_brackets.json"
+
+# Fallback defaults (Hardcoded 2026 values) in case JSON is missing/corrupt
+DEFAULT_BRACKETS = {
+    "single_home": [
+        (0, 1978745, 0.0),
+        (1978745, 2347040, 0.035),
+        (2347040, 6055070, 0.05),
+        (6055070, 20183565, 0.08),
+        (20183565, float("inf"), 0.10),
+    ],
+    "additional_home": [
+        (0, 6055070, 0.08),
+        (6055070, float("inf"), 0.10),
+    ]
+}
 
 
-def extract_brackets_from_text(text: str) -> List[Tuple[int, float, float]]:
+def load_tax_brackets_from_json() -> dict:
     """
-    NOTE: Extract purchase tax brackets from free text.
-    Inputs: text (str)
-    Outputs: list of tuples (low, high, rate)
+    Loads tax brackets from an external JSON file.
+    Returns a dictionary containing 'single_home' and 'additional_home' lists.
+    Falls back to hardcoded defaults if file reading fails.
     """
-    brackets: List[Tuple[int, float, float]] = []
+    path = resource_path(TAX_FILE_NAME)
 
-    # First bracket: "עד X ש"ח – לא ישולם מס"
-    m0 = re.search(r"עד\s+([\d,\.]+)\s+ש.?ח\s*–?\s*לא\s+ישולם\s+מס", text)
-    if m0:
-        first_high = int(m0.group(1).replace(",", ""))
-        brackets.append((0, first_high, 0.0))
-
-    # Middle brackets: "עד X ש"ח – Y%"
-    mid_limits: List[Tuple[int, float]] = []
-    for m in re.finditer(r"עד\s+([\d,\.]+)\s+ש.?ח\s*–?\s*(\d+(?:\.\d+)?)\s*%", text):
-        high = int(m.group(1).replace(",", ""))
-        rate = float(m.group(2)) / 100.0
-        mid_limits.append((high, rate))
-
-    low_cursor = brackets[-1][1] if brackets else 0
-    for high, rate in mid_limits:
-        if high > low_cursor:
-            brackets.append((low_cursor, high, rate))
-            low_cursor = high
-
-    # Last bracket: "על חלק השווי העולה על X ש"ח – Y%"
-    m_last = re.search(r"עולה\s+על\s+([\d,\.]+)\s+ש.?ח\s*–?\s*(\d+(?:\.\d+)?)\s*%", text)
-    if m_last:
-        last_low = int(m_last.group(1).replace(",", ""))
-        last_rate = float(m_last.group(2)) / 100.0
-        brackets.append((last_low, float("inf"), last_rate))
-
-    return brackets
-
-
-def fetch_purchase_tax_brackets() -> Optional[List[Tuple[int, float, float]]]:
-    """
-    NOTE: Fetch brackets from gov.il site.
-    Inputs: None
-    Outputs: list of brackets or None on failure
-    """
     try:
-        resp = requests.get(GOV_URL, timeout=10)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        text = soup.get_text(separator="\n")
-        return extract_brackets_from_text(text)
-    except Exception as e:
-        print(f"לא ניתן למשוך מדרגות מהאתר: {e}")
-        return None
+        if not os.path.exists(path):
+            print(f"DEBUG: JSON file not found at {path}. Using defaults.")
+            return DEFAULT_BRACKETS
+
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        # Parse and convert "inf" strings to float("inf")
+        parsed_brackets = {}
+        for key in ["single_home", "additional_home"]:
+            raw_list = data.get(key, [])
+            clean_list = []
+            for low, high, rate in raw_list:
+                # Handle "inf" from JSON
+                if isinstance(high, str) and high.lower() == "inf":
+                    high = float("inf")
+                clean_list.append((low, high, rate))
+            parsed_brackets[key] = clean_list
+
+        return parsed_brackets
+
+    except (json.JSONDecodeError, ValueError, Exception) as e:
+        print(f"ERROR: Failed to load/parse JSON ({e}). Using defaults.")
+        return DEFAULT_BRACKETS
 
 
-def get_purchase_tax_brackets() -> Tuple[List[Tuple[int, float, float]], dict]:
+def get_current_brackets(is_single_home: bool) -> List[Tuple[int, float, float]]:
     """
-    NOTE: Return purchase tax brackets with fallback.
-    Inputs: None
-    Outputs: (brackets list, meta dict)
+    Router function to get the correct list based on user selection.
     """
-    fetched = fetch_purchase_tax_brackets()
-    if fetched:
-        return fetched, {"source": GOV_URL}
+    all_brackets = load_tax_brackets_from_json()
+
+    if is_single_home:
+        return all_brackets.get("single_home", DEFAULT_BRACKETS["single_home"])
     else:
-        if DEBUG_TAX:
-            print("DEBUG: שימוש בגיבוי קשיח כי האתר לא זמין.")
-        return FALLBACK_PURCHASE_BRACKETS, {"source": "fallback"}
+        return all_brackets.get("additional_home", DEFAULT_BRACKETS["additional_home"])
 
 # ==============================
 # Tax calculation functions
@@ -204,49 +250,22 @@ def calculate_capital_gain_tax(
     return profit * 0.25
 
 
-def calculate_purchase_tax(price: float) -> float:
-    """
-    NOTE: Calculate purchase tax based on brackets (מס רכישה).
-    Inputs: price (float)
-    Outputs: tax amount (float)
-    """
-    brackets, _meta = get_purchase_tax_brackets()
+def calculate_purchase_tax(price: float, brackets) -> float:
     tax = 0.0
     for low, high, rate in brackets:
-        span_low = low
         span_high = min(high, price)
-        if span_high <= span_low:
+        if span_high <= low:
             continue
-        taxable_part = span_high - span_low
+        taxable_part = span_high - low
         tax += taxable_part * rate
     return tax
 
-def get_purchase_tax_breakdown(price: float):
-    """
-    NOTE: Calculate purchase tax breakdown per bracket.
-    Inputs: price (float)
-    Outputs: list of dicts: [
-        {
-            'index': int,
-            'low': float,
-            'high': float or inf,
-            'rate': float,
-            'taxable_amount': float,
-            'tax_amount': float
-        },
-        ...
-    ]
-    """
-    brackets, _meta = get_purchase_tax_brackets()
+def get_purchase_tax_breakdown(price: float, brackets):
     breakdown = []
 
     for i, (low, high, rate) in enumerate(brackets, start=1):
         span_high = min(high, price)
-        if span_high <= low:
-            taxable = 0.0
-        else:
-            taxable = span_high - low
-
+        taxable = max(0, span_high - low)
         tax_amount = taxable * rate
 
         breakdown.append({
@@ -493,6 +512,56 @@ def clear_history() -> None:
         widget.destroy()
 
 
+def export_to_csv() -> None:
+    """
+    NOTE: Export the saved history to a CSV file selected by the user.
+    Handles Hebrew encoding for Excel compatibility.
+    """
+    if not saved_calculations:
+        messagebox.showwarning("אין נתונים", "אין היסטוריית חישובים לייצוא.")
+        return
+
+    # Ask user where to save
+    file_path = filedialog.asksaveasfilename(
+        defaultextension=".csv",
+        filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")],
+        title="שמור דוח כקובץ CSV"
+    )
+
+    if not file_path:
+        return  # User cancelled
+
+    # Define Hebrew headers mapping
+    # Maps internal keys to Hebrew column names
+    field_mapping = {
+        "sale_price": "מחיר מכירה",
+        "broker_fee_sale_percent": "תיווך מכירה (%)",
+        "lawyer_fee_sale_percent": "עו\"ד מכירה (%)",
+        "tax_sale": "מס שבח (לתשלום)",
+        "total_sale": "סה\"כ נטו ממכירה",
+        "buy_price": "מחיר קנייה",
+        "broker_fee_buy_percent": "תיווך קנייה (%)",
+        "lawyer_fee_buy_percent": "עו\"ד קנייה (%)",
+        "tax_buy": "מס רכישה (לתשלום)",
+        "total_buy": "סה\"כ עלות קנייה",
+        "difference": "הפרש נטו",
+        "status": "סטטוס"
+    }
+
+    try:
+        with open(file_path, mode='w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=field_mapping.values())
+            writer.writeheader()
+
+            for calc in saved_calculations:
+                # Create a row with Hebrew keys based on the mapping
+                row = {heb_key: calc.get(eng_key, "") for eng_key, heb_key in field_mapping.items()}
+                writer.writerow(row)
+
+        messagebox.showinfo("הצלחה", "הקובץ נשמר בהצלחה!")
+
+    except Exception as e:
+        messagebox.showerror("שגיאה", f"שגיאה בשמירת הקובץ:\n{e}")
 # ==============================
 # Calculation and rendering
 # ==============================
@@ -504,6 +573,8 @@ def calculate() -> None:
     Outputs: None (updates the GUI)
     """
     global last_result, current_purchase_canvas, current_sale_canvas
+
+    # No network calls needed. Loading JSON happens instantly.
 
     try:
         # Inputs - sale
@@ -519,14 +590,24 @@ def calculate() -> None:
         broker_fee_buy_percent = safe_float(entry_broker_buy, "עמלת תיווך קנייה", min_val=0, max_val=100)
         lawyer_fee_buy_percent = safe_float(entry_lawyer_buy, "עמלת עו\"ד קנייה", min_val=0, max_val=100)
 
-        is_single_home = is_single_home_var.get()
+        # Logic Flags
+        is_single_home_sale = is_single_home_var.get()  # Checkbox for Sale
+        is_single_home_buy = is_single_home_purchase_var.get()  # Checkbox for Purchase (NEW)
         held_over_18_months = held_over_18_var.get()
 
         # Taxes
+        # UPDATE: Fetch brackets based on the PURCHASE checkbox status
+        # If checked (True) -> Single home brackets (0% start)
+        # If unchecked (False) -> Additional home brackets (8% start)
+        brackets = get_current_brackets(is_single_home_buy)
+
         tax_sale = calculate_capital_gain_tax(
-            sale_price, purchase_price, expenses, is_single_home, held_over_18_months, exemption_limit
+            sale_price, purchase_price, expenses, is_single_home_sale, held_over_18_months, exemption_limit
         )
-        tax_buy = calculate_purchase_tax(buy_price)
+        tax_buy = calculate_purchase_tax(buy_price, brackets)
+
+
+
 
         # Fees
         broker_fee_sale = sale_price * (broker_fee_sale_percent / 100.0)
@@ -623,7 +704,7 @@ def calculate() -> None:
             w.destroy()
 
         # 1. Build breakdown for purchase tax per bracket
-        breakdown = get_purchase_tax_breakdown(buy_price)
+        breakdown = get_purchase_tax_breakdown(buy_price, brackets)
 
         # 2. Build stacked bar: purchase price split by brackets (numbers only)
         fig, colors = build_purchase_brackets_bar(buy_price, breakdown)
@@ -720,10 +801,13 @@ def create_gui() -> None:
     global entry_sale_price, entry_broker_sale, entry_lawyer_sale, entry_purchase_price, entry_expenses, entry_exemption_limit
     global entry_buy_price, entry_broker_buy, entry_lawyer_buy
     global is_single_home_var, held_over_18_var, counter_label
+    global is_single_home_purchase_var
 
     # Root and basic options
     root = tk.Tk()
-    root.title("מחשבון נדל\"ן")
+    root.title("מחשבון נדל\"ן (מערכות)")
+    # === תיקון 1: קביעת גודל חלון התחלתי גדול יותר ===
+    root.geometry("1400x900")
     root.option_add("*Font", "Arial 16")
 
     # Layout: 3 columns (sale, buy, graphs)
@@ -731,30 +815,28 @@ def create_gui() -> None:
     root.columnconfigure(1, weight=1)
     root.columnconfigure(2, weight=1)
 
-    # Try to load images (optional)
+    # --- IMAGES (Row 0) ---
     try:
         sell_img = tk.PhotoImage(file=resource_path("SellHouse.png"))
         buy_img = tk.PhotoImage(file=resource_path("BuyHouse.png"))
         tk.Label(root, image=sell_img).grid(row=0, column=0, pady=5)
         tk.Label(root, image=buy_img).grid(row=0, column=1, pady=5)
-        # Keep references to avoid garbage collection
         root.sell_img = sell_img
         root.buy_img = buy_img
     except Exception:
-        # If images missing, show textual headers only
         pass
 
-    # Top headers
+    # --- HEADERS (Row 1) ---
     tk.Label(root, text="מכירה", font=("Arial", 16, "bold")).grid(row=1, column=0, pady=5)
     tk.Label(root, text="קנייה", font=("Arial", 16, "bold")).grid(row=1, column=1, pady=5)
 
-    # Frames for columns
+    # --- INPUT FRAMES (Row 2) ---
     sale_frame = tk.Frame(root)
     buy_frame = tk.Frame(root)
     sale_frame.grid(row=2, column=0, padx=10, pady=5, sticky="n")
     buy_frame.grid(row=2, column=1, padx=10, pady=5, sticky="n")
 
-    # ===== Sale column =====
+    # [Sale Inputs]
     tk.Label(sale_frame, text="מחיר מכירה (₪)").grid(row=0, column=0, sticky="w")
     entry_sale_price = tk.Entry(sale_frame)
     entry_sale_price.grid(row=0, column=1, sticky="e")
@@ -776,17 +858,19 @@ def create_gui() -> None:
     entry_expenses.grid(row=4, column=1, sticky="e")
 
     is_single_home_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(sale_frame, text="דירה יחידה", variable=is_single_home_var).grid(row=5, column=0, columnspan=2, sticky="w")
+    tk.Checkbutton(sale_frame, text="דירה יחידה (פטור שבח)", variable=is_single_home_var).grid(row=5, column=0,
+                                                                                               columnspan=2, sticky="w")
 
     held_over_18_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(sale_frame, text="החזקה מעל 18 חודשים", variable=held_over_18_var).grid(row=6, column=0, columnspan=2, sticky="w")
+    tk.Checkbutton(sale_frame, text="החזקה מעל 18 חודשים", variable=held_over_18_var).grid(row=6, column=0,
+                                                                                           columnspan=2, sticky="w")
 
     tk.Label(sale_frame, text="תקרת פטור (₪)").grid(row=7, column=0, sticky="w")
     entry_exemption_limit = tk.Entry(sale_frame)
-    entry_exemption_limit.insert(0, "5,008,000")  # default with commas for readability
+    entry_exemption_limit.insert(0, "5,008,000")
     entry_exemption_limit.grid(row=7, column=1, sticky="e")
 
-    # ===== Buy column =====
+    # [Buy Inputs]
     tk.Label(buy_frame, text="מחיר קנייה (₪)").grid(row=0, column=0, sticky="w")
     entry_buy_price = tk.Entry(buy_frame)
     entry_buy_price.grid(row=0, column=1, sticky="e")
@@ -799,38 +883,64 @@ def create_gui() -> None:
     entry_lawyer_buy = tk.Entry(buy_frame)
     entry_lawyer_buy.grid(row=2, column=1, sticky="e")
 
-    # Calculate button
-    tk.Button(root, text="חשב", command=calculate, font=("Arial", 18, "bold")).grid(row=3, column=0, columnspan=2, pady=10)
+    is_single_home_purchase_var = tk.BooleanVar(value=True)
+    tk.Checkbutton(buy_frame, text="דירה יחידה (לחישוב מס רכישה)", variable=is_single_home_purchase_var).grid(row=3,
+                                                                                                              column=0,
+                                                                                                              columnspan=2,
+                                                                                                              sticky="w")
 
-    # Exit button (right)
-    tk.Button(root, text="❌ סיום", command=root.destroy, bg="lightgray").grid(row=4, column=1, sticky="e", pady=10)
+    # --- BUTTONS (Rows 3, 4) ---
+    tk.Button(root, text="חשב", command=calculate, font=("Arial", 18, "bold"), bg="#e0f7fa").grid(row=3, column=0,
+                                                                                                  columnspan=2, pady=10)
 
-    # Save calculation button (left)
-    tk.Button(root, text="שמור חישוב", command=save_calculation, bg="lightblue").grid(row=3, column=0, sticky="w", pady=10)
+    tk.Button(root, text="שמור חישוב", command=save_calculation, bg="lightblue").grid(row=4, column=0, sticky="w",
+                                                                                      padx=10)
+    tk.Label(root, text="(יש ללחוץ 'חשב' לפני השמירה)", font=("Arial", 10), fg="gray").grid(row=4, column=0, sticky="e",
+                                                                                            padx=50)
+    tk.Button(root, text="❌ סיום", command=root.destroy, bg="lightgray").grid(row=4, column=1, sticky="e", padx=10)
 
-    # Note under save
-    tk.Label(root, text="כדי לשמור חישוב נוכחי יש ללחוץ קודם על 'חשב'", font=("Arial", 14), fg="green").grid(row=4, column=0, sticky="w")
+    # --- Layout Separation (Rows 5-10) ---
 
-    # History controls
-    counter_label = tk.Label(root, text="0/10", font=("Arial", 12), fg="green")
-    counter_label.grid(row=6, column=0, sticky="w")
+    # עמודה 0 (שמאל): כפתורי היסטוריה
+    history_frame = tk.Frame(root)
+    history_frame.grid(row=5, column=0, rowspan=5, sticky="nw", padx=10, pady=20)
 
-    tk.Button(root, text="הצג היסטוריית חישובים", command=show_history, bg="lightyellow").grid(row=5, column=0, sticky="w", pady=5)
-    tk.Button(root, text="מחק היסטוריה", command=clear_history, bg="lightpink").grid(row=7, column=0, sticky="w", pady=5)
+    counter_label = tk.Label(history_frame, text="0/10", font=("Arial", 12), fg="green")
+    counter_label.pack(anchor="w", pady=2)
+    tk.Button(history_frame, text="הצג היסטוריה 📜", command=show_history, bg="lightyellow", width=20).pack(anchor="w",
+                                                                                                           pady=5)
+    tk.Button(history_frame, text="מחק היסטוריה 🗑️", command=clear_history, bg="lightpink", width=20).pack(anchor="w",
+                                                                                                           pady=5)
+    tk.Button(history_frame, text="ייצוא ל-CSV 💾", command=export_to_csv, bg="#dcedc8", width=20).pack(anchor="w",
+                                                                                                       pady=5)
 
-    # Result frame
-    frame_result = tk.Frame(root)
-    frame_result.grid(row=6, column=0, columnspan=2, pady=20, sticky="n")
+    # עמודה 1 (מרכז/ימין): תוצאות החישוב
+    # === תיקון 2: העלאת התוצאות לשורה 5 בעמודה נפרדת ===
+    frame_result = tk.Frame(root, bd=2, relief="groove")
+    frame_result.grid(row=5, column=1, rowspan=10, sticky="n", padx=10, pady=10)
 
-    # Right graphs frame (column 2)
+    # --- GRAPHS (Row 2, spanning down) ---
     frame_graphs = tk.Frame(root)
-    frame_graphs.grid(row=2, column=2, rowspan=6, padx=10, pady=5, sticky="nsew")
+    frame_graphs.grid(row=2, column=2, rowspan=15, padx=10, pady=5, sticky="nsew")
+
+    # Weights
     root.rowconfigure(2, weight=1)
-    root.rowconfigure(3, weight=0)
-    root.rowconfigure(4, weight=0)
-    root.rowconfigure(5, weight=0)
-    root.rowconfigure(6, weight=1)
+    root.rowconfigure(5, weight=1)
     root.columnconfigure(2, weight=1)
+
+    # --- FOOTER (Row 20 - BOTTOM) ---
+    footer_frame = tk.Frame(root, bd=1, relief="sunken", bg="#e0e0e0")
+    footer_frame.grid(row=20, column=0, columnspan=3, sticky="ew", padx=0, pady=(20, 0))
+
+    tk.Label(footer_frame, text=" המערכת טענה מדרגות מס מקובץ מקומי.",
+             bg="#e0e0e0", fg="#333333", font=("Arial", 10)).pack(side="right", padx=10)
+
+    tk.Button(footer_frame, text="⚙️ הגדרות מדרגות מס",
+              command=show_current_tax_brackets_window,
+              font=("Arial", 9, "bold"), bg="white", bd=1).pack(side="left", padx=5, pady=2)
+
+    root.rowconfigure(20, weight=0)
+
 
 # ==============================
 # Main
