@@ -2,6 +2,7 @@
                Real Estate Calculator
 *****************************************************
 
+![ScreenShot](Screenshot.png)
 ---------------------
 1. Description
 ---------------------
